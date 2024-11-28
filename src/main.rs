@@ -1,9 +1,9 @@
 use aho_corasick::AhoCorasick;
 use clap::Parser;
-use crossbeam_channel::{unbounded, Sender};
+use crossbeam_channel::{bounded, Sender};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use memmap2::Mmap;
 use num_cpus;
+use rayon::prelude::*;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -29,21 +29,39 @@ struct Args {
     #[arg(short, long, value_parser, default_value = "output.txt")]
     output: PathBuf,
 
-    #[arg(short = 's', long, default_value_t = 1000)]
+    #[arg(short = 's', long, default_value_t = 10_000)]
     buffer_size: usize,
 }
 
 fn main() -> io::Result<()> {
     let args = Args::parse();
 
-    let blacklist = load_blacklist(&args.blacklist)?;
-    let aho = AhoCorasick::builder()
+    let blacklist = match load_blacklist(&args.blacklist) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to load blacklist: {}", e);
+            return Err(e);
+        }
+    };
+
+    let aho = match AhoCorasick::builder()
         .ascii_case_insensitive(true)
         .build(&blacklist)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    let aho = Arc::new(aho);
+    {
+        Ok(a) => Arc::new(a),
+        Err(e) => {
+            eprintln!("Failed to build Aho-Corasick automaton: {}", e);
+            return Err(io::Error::new(io::ErrorKind::Other, e));
+        }
+    };
 
-    let files = collect_files_recursive(&args.directory)?;
+    let files = match collect_files_recursive(&args.directory) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Failed to collect files: {}", e);
+            return Err(e);
+        }
+    };
     let total_files = files.len();
 
     let m = MultiProgress::new();
@@ -57,7 +75,7 @@ fn main() -> io::Result<()> {
     let lines_processed = Arc::new(AtomicU64::new(0));
     let lines_filtered = Arc::new(AtomicU64::new(0));
 
-    let (tx, rx) = unbounded::<Vec<String>>();
+    let (tx, rx) = bounded::<Vec<String>>(100);
 
     let pb_writer = pb.clone();
     let m_writer = m.clone();
@@ -66,70 +84,87 @@ fn main() -> io::Result<()> {
     let writer_handle = {
         let m = m_writer;
         let pb_writer = pb_writer;
-        let handle = std::thread::spawn(move || -> io::Result<()> {
-            let mut temp_output = NamedTempFile::new()?;
-            {
-                let mut writer = BufWriter::new(temp_output.as_file_mut());
+        let output_path = output_path.clone();
+        std::thread::spawn(move || -> io::Result<()> {
+            let mut temp_output = NamedTempFile::new().map_err(|e| {
+                eprintln!("Failed to create temporary file: {}", e);
+                e
+            })?;
+            let mut writer = BufWriter::with_capacity(16 * 1024, temp_output.as_file_mut());
 
-                for lines in rx {
-                    for line in lines {
-                        writeln!(writer, "{}", line)?;
-                    }
+            for lines in rx {
+                if lines.is_empty() {
+                    continue;
                 }
 
-                writer.flush()?;
+                let total_length: usize = lines.iter().map(|line| line.len() + 1).sum();
+                let mut batch_string = String::with_capacity(total_length);
+                for line in lines {
+                    batch_string.push_str(&line);
+                    batch_string.push('\n');
+                }
+
+                if let Err(e) = writer.write_all(batch_string.as_bytes()) {
+                    eprintln!("Failed to write to temporary file: {}", e);
+                    return Err(e);
+                }
             }
+
+            if let Err(e) = writer.flush() {
+                eprintln!("Failed to flush writer: {}", e);
+                return Err(e);
+            }
+            drop(writer);
 
             m.remove(&pb_writer);
 
             if output_path.exists() {
-                fs::remove_file(&output_path)?;
+                if let Err(e) = fs::remove_file(&output_path) {
+                    eprintln!("Failed to remove existing output file: {}", e);
+                    return Err(e);
+                }
             }
 
-            temp_output.persist(&output_path)?;
-            Ok(())
-        });
-        handle
-    };
+            if let Err(e) = temp_output.persist(&output_path) {
+                eprintln!("Failed to persist temporary file to output: {}", e);
+                return Err(e.into());
+            }
 
-    let processing_pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(num_cpus::get())
-        .build()
-        .unwrap();
+            Ok(())
+        })
+    };
 
     let aho_clone = aho.clone();
     let tx_clone = tx.clone();
     let lines_processed_clone = lines_processed.clone();
     let lines_filtered_clone = lines_filtered.clone();
 
-    processing_pool.scope(|s| {
-        for file_path in files {
-            let aho = aho_clone.clone();
-            let tx = tx_clone.clone();
-            let lines_processed = lines_processed_clone.clone();
-            let lines_filtered = lines_filtered_clone.clone();
-            let pb = pb.clone();
-            let buffer_size = buffer_size;
+    let processing_pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_cpus::get())
+        .build()
+        .unwrap();
 
-            s.spawn(move |_| {
-                if let Err(e) = process_file(
-                    &file_path,
-                    &aho,
-                    &tx,
-                    &lines_processed,
-                    &lines_filtered,
-                    buffer_size,
-                ) {
-                    eprintln!("Error processing file {:?}: {}", file_path, e);
-                }
-                pb.inc(1);
-            });
-        }
+    processing_pool.scope(|s| {
+        files.par_iter().for_each(|file_path| {
+            if let Err(e) = process_file(
+                file_path,
+                &aho_clone,
+                &tx_clone,
+                &lines_processed_clone,
+                &lines_filtered_clone,
+                buffer_size,
+            ) {
+                eprintln!("Error processing file {:?}: {}", file_path, e);
+            }
+            pb.inc(1);
+        });
     });
 
     drop(tx);
 
-    writer_handle.join().expect("Writer thread panicked")?;
+    if let Err(e) = writer_handle.join() {
+        eprintln!("Writer thread panicked: {:?}", e);
+    }
 
     pb.finish_with_message("Processing complete.");
 
@@ -147,12 +182,23 @@ fn main() -> io::Result<()> {
 
 fn load_blacklist(blacklist_path: &Path) -> io::Result<Vec<String>> {
     let file = File::open(blacklist_path)?;
-    let reader = BufReader::new(file);
+    let reader = BufReader::with_capacity(16 * 1024, file);
     let tokens = reader
         .lines()
-        .filter_map(Result::ok)
-        .map(|line| line.trim().to_string())
-        .filter(|line| !line.is_empty())
+        .filter_map(|line| match line {
+            Ok(l) => {
+                let trimmed = l.trim().to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            }
+            Err(e) => {
+                eprintln!("Error reading blacklist line: {}", e);
+                None
+            }
+        })
         .collect();
     Ok(tokens)
 }
@@ -162,7 +208,14 @@ fn collect_files_recursive(dir: &Path) -> io::Result<Vec<PathBuf>> {
     for entry in WalkDir::new(dir)
         .follow_links(true)
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            if let Err(e) = e {
+                eprintln!("Error reading directory entry: {}", e);
+                None
+            } else {
+                Some(e.unwrap())
+            }
+        })
         .filter(|e| e.file_type().is_file())
     {
         files.push(entry.into_path());
@@ -178,47 +231,30 @@ fn process_file(
     lines_filtered: &Arc<AtomicU64>,
     buffer_size: usize,
 ) -> io::Result<()> {
-    use std::ffi::c_void;
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::FromRawHandle;
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::INVALID_HANDLE_VALUE;
-    use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_FLAG_SEQUENTIAL_SCAN, FILE_GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
-    };
-
-    let wide_path: Vec<u16> = file_path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    let handle = unsafe {
-        CreateFileW(
-            PCWSTR(wide_path.as_ptr()),
-            FILE_GENERIC_READ.0,
-            FILE_SHARE_READ,
-            None,
-            OPEN_EXISTING,
-            FILE_FLAG_SEQUENTIAL_SCAN,
-            None,
-        )
-    };
-
-    if handle == Ok(INVALID_HANDLE_VALUE) {
-        return Err(io::Error::last_os_error());
-    }
-
-    let file = unsafe { File::from_raw_handle(handle.unwrap().0 as *mut c_void) };
-    let mmap = unsafe { Mmap::map(&file)? };
-    let content = String::from_utf8_lossy(&mmap);
+    let file = File::open(file_path).map_err(|e| {
+        eprintln!("Failed to open file {:?}: {}", file_path, e);
+        e
+    })?;
+    let mut reader = BufReader::with_capacity(16 * 1024, file);
+    let mut buffer = Vec::new();
 
     let mut filtered_lines = Vec::with_capacity(buffer_size);
 
-    for line in content.lines() {
+    loop {
+        buffer.clear();
+        let bytes_read = reader.read_until(b'\n', &mut buffer).map_err(|e| {
+            eprintln!("Failed to read from file {:?}: {}", file_path, e);
+            e
+        })?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        let line = String::from_utf8_lossy(&buffer);
+
         lines_processed.fetch_add(1, Ordering::Relaxed);
 
-        if aho.is_match(line) {
+        if aho.is_match(line.as_ref()) {
             lines_filtered.fetch_add(1, Ordering::Relaxed);
             continue;
         }
@@ -227,16 +263,16 @@ fn process_file(
 
         if filtered_lines.len() >= buffer_size {
             let batch = std::mem::take(&mut filtered_lines);
-            if sender.send(batch).is_err() {
-                eprintln!("Error sending batch to writer");
+            if let Err(e) = sender.send(batch) {
+                eprintln!("Error sending batch to writer: {}", e);
+                break;
             }
         }
     }
 
     if !filtered_lines.is_empty() {
-        let batch = std::mem::take(&mut filtered_lines);
-        if sender.send(batch).is_err() {
-            eprintln!("Error sending final batch to writer");
+        if let Err(e) = sender.send(std::mem::take(&mut filtered_lines)) {
+            eprintln!("Error sending final batch to writer: {}", e);
         }
     }
 
