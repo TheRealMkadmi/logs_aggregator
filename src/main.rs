@@ -75,7 +75,7 @@ fn main() -> io::Result<()> {
     let lines_processed = Arc::new(AtomicU64::new(0));
     let lines_filtered = Arc::new(AtomicU64::new(0));
 
-    let (tx, rx) = bounded::<Vec<String>>(100);
+    let (tx, rx) = bounded::<Vec<String>>(1000); // Increased channel capacity
 
     let pb_writer = pb.clone();
     let m_writer = m.clone();
@@ -92,7 +92,7 @@ fn main() -> io::Result<()> {
             })?;
             let mut writer = BufWriter::with_capacity(16 * 1024, temp_output.as_file_mut());
 
-            for lines in rx {
+            for lines in rx.iter() {
                 if lines.is_empty() {
                     continue;
                 }
@@ -130,12 +130,12 @@ fn main() -> io::Result<()> {
                 return Err(e.into());
             }
 
+            eprintln!("Writer thread completed successfully.");
             Ok(())
         })
     };
 
     let aho_clone = aho.clone();
-    let tx_clone = tx.clone();
     let lines_processed_clone = lines_processed.clone();
     let lines_filtered_clone = lines_filtered.clone();
 
@@ -145,6 +145,7 @@ fn main() -> io::Result<()> {
         .unwrap();
 
     processing_pool.scope(|s| {
+        let tx_clone = tx.clone(); // Move tx_clone inside the scope
         files.par_iter().for_each(|file_path| {
             if let Err(e) = process_file(
                 file_path,
@@ -158,13 +159,14 @@ fn main() -> io::Result<()> {
             }
             pb.inc(1);
         });
+        drop(tx_clone); // Explicitly drop tx_clone when processing is done
     });
 
-    drop(tx);
+    drop(tx); // Drop the original sender
 
-    if let Err(e) = writer_handle.join() {
-        eprintln!("Writer thread panicked: {:?}", e);
-    }
+    writer_handle
+        .join()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "Writer thread panicked"))??; // Ensure proper error handling
 
     pb.finish_with_message("Processing complete.");
 
