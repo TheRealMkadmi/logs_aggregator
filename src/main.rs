@@ -1,23 +1,16 @@
 use aho_corasick::AhoCorasick;
 use clap::Parser;
+use crossbeam_channel::{unbounded, Sender};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use memmap2::Mmap;
 use num_cpus;
-use parking_lot::Mutex;
-use std::fs::{File, OpenOptions};
-use std::io::{self, BufRead, BufReader, Write};
-use std::os::windows::ffi::OsStrExt;
-use std::os::windows::io::FromRawHandle;
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc::{self, Sender};
-use tokio::task;
+use tempfile::NamedTempFile;
 use walkdir::WalkDir;
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
-use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_SEQUENTIAL_SCAN, FILE_GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
-};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -36,16 +29,13 @@ struct Args {
     #[arg(short, long, value_parser, default_value = "output.txt")]
     output: PathBuf,
 
-    #[arg(short = 'b', long, default_value_t = 1000)]
+    #[arg(short = 's', long, default_value_t = 1000)]
     buffer_size: usize,
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
-async fn main() -> io::Result<()> {
-    // Parse command-line arguments
+fn main() -> io::Result<()> {
     let args = Args::parse();
 
-    // Load blacklist tokens and build Aho-Corasick automaton for case-insensitive matching
     let blacklist = load_blacklist(&args.blacklist)?;
     let aho = AhoCorasick::builder()
         .ascii_case_insensitive(true)
@@ -53,11 +43,9 @@ async fn main() -> io::Result<()> {
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let aho = Arc::new(aho);
 
-    // Collect all file paths recursively in the specified directory
     let files = collect_files_recursive(&args.directory)?;
     let total_files = files.len();
 
-    // Setup progress bars
     let m = MultiProgress::new();
     let pb = m.add(ProgressBar::new(total_files as u64));
     let style = ProgressStyle::default_bar()
@@ -66,39 +54,42 @@ async fn main() -> io::Result<()> {
         .progress_chars("#>-");
     pb.set_style(style.clone());
 
-    // Statistics
-    let lines_processed = Arc::new(Mutex::new(0u64));
-    let lines_filtered = Arc::new(Mutex::new(0u64));
+    let lines_processed = Arc::new(AtomicU64::new(0));
+    let lines_filtered = Arc::new(AtomicU64::new(0));
 
-    // Create an asynchronous channel for sending filtered lines to writer tasks
-    let (tx, mut rx) = mpsc::channel::<Vec<String>>(args.buffer_size);
+    let (tx, rx) = unbounded::<Vec<String>>();
 
-    // Clone pb for writer task
     let pb_writer = pb.clone();
-
-    // Spawn writer tasks
+    let m_writer = m.clone();
+    let buffer_size = args.buffer_size;
+    let output_path = args.output.clone();
     let writer_handle = {
-        let output_path = args.output.clone();
-        let m = m.clone();
-        task::spawn(async move {
-            let output_file = OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(true)
-                .open(&output_path)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            let mut writer = io::BufWriter::new(output_file);
+        let m = m_writer;
+        let pb_writer = pb_writer;
+        let handle = std::thread::spawn(move || -> io::Result<()> {
+            let mut temp_output = NamedTempFile::new()?;
+            {
+                let mut writer = BufWriter::new(temp_output.as_file_mut());
 
-            while let Some(lines) = rx.recv().await {
-                for line in lines {
-                    writeln!(writer, "{}", line)?;
+                for lines in rx {
+                    for line in lines {
+                        writeln!(writer, "{}", line)?;
+                    }
                 }
+
+                writer.flush()?;
             }
 
-            writer.flush()?;
             m.remove(&pb_writer);
-            Ok::<(), io::Error>(())
-        })
+
+            if output_path.exists() {
+                fs::remove_file(&output_path)?;
+            }
+
+            temp_output.persist(&output_path)?;
+            Ok(())
+        });
+        handle
     };
 
     let processing_pool = rayon::ThreadPoolBuilder::new()
@@ -118,11 +109,17 @@ async fn main() -> io::Result<()> {
             let lines_processed = lines_processed_clone.clone();
             let lines_filtered = lines_filtered_clone.clone();
             let pb = pb.clone();
+            let buffer_size = buffer_size;
 
             s.spawn(move |_| {
-                if let Err(e) =
-                    process_file(&file_path, &aho, &tx, &lines_processed, &lines_filtered)
-                {
+                if let Err(e) = process_file(
+                    &file_path,
+                    &aho,
+                    &tx,
+                    &lines_processed,
+                    &lines_filtered,
+                    buffer_size,
+                ) {
                     eprintln!("Error processing file {:?}: {}", file_path, e);
                 }
                 pb.inc(1);
@@ -132,12 +129,12 @@ async fn main() -> io::Result<()> {
 
     drop(tx);
 
-    writer_handle.await??;
+    writer_handle.join().expect("Writer thread panicked")?;
 
     pb.finish_with_message("Processing complete.");
 
-    let total_lines = *lines_processed.lock();
-    let total_filtered = *lines_filtered.lock();
+    let total_lines = lines_processed.load(Ordering::Relaxed);
+    let total_filtered = lines_filtered.load(Ordering::Relaxed);
     println!("Total lines processed: {}", total_lines);
     println!("Total lines filtered out: {}", total_filtered);
     println!(
@@ -177,9 +174,19 @@ fn process_file(
     file_path: &Path,
     aho: &AhoCorasick,
     sender: &Sender<Vec<String>>,
-    lines_processed: &Arc<Mutex<u64>>,
-    lines_filtered: &Arc<Mutex<u64>>,
+    lines_processed: &Arc<AtomicU64>,
+    lines_filtered: &Arc<AtomicU64>,
+    buffer_size: usize,
 ) -> io::Result<()> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_FLAG_SEQUENTIAL_SCAN, FILE_GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
+    };
+
     let wide_path: Vec<u16> = file_path
         .as_os_str()
         .encode_wide()
@@ -194,7 +201,7 @@ fn process_file(
             None,
             OPEN_EXISTING,
             FILE_FLAG_SEQUENTIAL_SCAN,
-            HANDLE::default(),
+            None,
         )
     };
 
@@ -202,45 +209,35 @@ fn process_file(
         return Err(io::Error::last_os_error());
     }
 
-    let file = unsafe { File::from_raw_handle(handle.unwrap().0 as _) };
+    let file = unsafe { File::from_raw_handle(handle.unwrap().0 as *mut c_void) };
     let mmap = unsafe { Mmap::map(&file)? };
     let content = String::from_utf8_lossy(&mmap);
 
-    let mut filtered_lines = Vec::new();
+    let mut filtered_lines = Vec::with_capacity(buffer_size);
 
     for line in content.lines() {
-        {
-            let mut lp = lines_processed.lock();
-            *lp += 1;
-        }
+        lines_processed.fetch_add(1, Ordering::Relaxed);
 
         if aho.is_match(line) {
-            let mut lf = lines_filtered.lock();
-            *lf += 1;
+            lines_filtered.fetch_add(1, Ordering::Relaxed);
             continue;
         }
 
         filtered_lines.push(line.to_string());
 
-        if filtered_lines.len() >= 1000 {
+        if filtered_lines.len() >= buffer_size {
             let batch = std::mem::take(&mut filtered_lines);
-            let sender_clone = sender.clone();
-            task::spawn(async move {
-                if let Err(e) = sender_clone.send(batch).await {
-                    eprintln!("Error sending batch to writer: {}", e);
-                }
-            });
+            if sender.send(batch).is_err() {
+                eprintln!("Error sending batch to writer");
+            }
         }
     }
 
     if !filtered_lines.is_empty() {
         let batch = std::mem::take(&mut filtered_lines);
-        let sender_clone = sender.clone();
-        task::spawn(async move {
-            if let Err(e) = sender_clone.send(batch).await {
-                eprintln!("Error sending final batch to writer: {}", e);
-            }
-        });
+        if sender.send(batch).is_err() {
+            eprintln!("Error sending final batch to writer");
+        }
     }
 
     Ok(())
