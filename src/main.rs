@@ -97,11 +97,10 @@ fn main() -> io::Result<()> {
                     continue;
                 }
 
-                let total_length: usize = lines.iter().map(|line| line.len() + 1).sum();
+                let total_length: usize = lines.iter().map(|line| line.len()).sum();
                 let mut batch_string = String::with_capacity(total_length);
                 for line in lines {
                     batch_string.push_str(&line);
-                    batch_string.push('\n');
                 }
 
                 if let Err(e) = writer.write_all(batch_string.as_bytes()) {
